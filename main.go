@@ -3,15 +3,16 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
+	"go-prequel/client"
+	"go-prequel/metrics"
+	"go-prequel/server"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-	"go-prequel/client"
-	"go-prequel/server"
-	"fmt"
-	"math/rand"
 )
 
 func main() {
@@ -39,6 +40,11 @@ func runServer(port string) {
 	}
 }
 
+func collectMetrics() {
+	metrics.InitClientMetrics()
+	metrics.StartMetricsServer("localhost:8099")
+}
+
 func runClient(configPath string) {
 	file, err := os.Open(configPath)
 	if err != nil {
@@ -59,6 +65,7 @@ func runClient(configPath string) {
 	// Channel to listen for OS signals
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	collectMetrics()
 
 	for {
 		select {

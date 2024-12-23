@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"go-prequel/metrics"
 	"net/http"
 	"sync"
 	"time"
@@ -11,13 +12,12 @@ import (
 
 // ProbeInfo represents a single probe response
 type ProbeInfo struct {
-	RIF       uint64 // Request in flight counter from server
-	Latency   time.Duration
-	ServerID  string
-	Timestamp time.Time
-	UseCount  int       // Number of times this probe has been reused
-	RIFDist   []float64 // Estimated RIF distribution for this server
-	MaxRIF    uint64    // Maximum RIF value seen for this probe
+	RIF           uint64 // Request in flight counter from server
+	Latency       time.Duration
+	ServerID      string
+	Timestamp     time.Time
+	UseCount      int     // Number of times this probe has been reused
+	NormalizedRIF float64 // Normalized RIF value for this server
 }
 
 // Config holds client configuration
@@ -50,6 +50,9 @@ type Client struct {
 	// Channel to control probe rate
 	probeTicker *time.Ticker
 	done        chan struct{}
+
+	// Track maximum RIF seen across all servers
+	maxRIF uint64
 }
 
 // NewClient creates a new client with the given configuration and server addresses
@@ -76,7 +79,8 @@ func NewClient(config Config, servers []string) *Client {
 		pool: ServerPool{
 			Servers: servers,
 		},
-		done: make(chan struct{}),
+		done:   make(chan struct{}),
+		maxRIF: 0, // Initialize maxRIF
 	}
 
 	// Start probe ticker based on probe rate
@@ -98,61 +102,22 @@ func calculateBReuse(config Config) int {
 	return int(bReuse)
 }
 
-// updateRIFDistribution updates the RIF distribution estimate for a probe
 func (c *Client) updateRIFDistribution(probe *ProbeInfo) {
-	// Keep a window of the last N RIF values for distribution estimation
-	const windowSize = 100
-
-	// Update maximum RIF seen
-	if probe.RIF > probe.MaxRIF {
-		probe.MaxRIF = probe.RIF
+	if c.maxRIF > 0 {
+		probe.NormalizedRIF = float64(probe.RIF) / float64(c.maxRIF)
+	} else {
+		probe.NormalizedRIF = 1
 	}
-
-	// Convert current RIF to normalized float64 (between 0 and 1)
-	var rifValue float64
-	if probe.MaxRIF > 0 {
-		rifValue = float64(probe.RIF) / float64(probe.MaxRIF)
-	}
-
-	// Initialize distribution if needed
-	if probe.RIFDist == nil {
-		probe.RIFDist = make([]float64, 0, windowSize)
-	}
-
-	// Add new normalized value
-	probe.RIFDist = append(probe.RIFDist, rifValue)
-
-	// Maintain window size
-	if len(probe.RIFDist) > windowSize {
-		probe.RIFDist = probe.RIFDist[1:]
-	}
-}
-
-// estimateRIFDistribution returns the estimated RIF distribution value for a probe
-func (c *Client) estimateRIFDistribution(probe ProbeInfo) float64 {
-	if len(probe.RIFDist) == 0 {
-		if probe.MaxRIF > 0 {
-			return float64(probe.RIF) / float64(probe.MaxRIF)
-		}
-		return 0
-	}
-
-	// Calculate mean of the normalized distribution
-	var sum float64
-	for _, v := range probe.RIFDist {
-		sum += v
-	}
-	return sum / float64(len(probe.RIFDist))
 }
 
 // isProbeHot determines if a probe represents a hot server
 func (c *Client) isProbeHot(probe ProbeInfo) bool {
 	// Compare the estimated RIF distribution with QRIFThreshold
-	return c.estimateRIFDistribution(probe) >= c.config.QRIFThreshold
+	return probe.NormalizedRIF >= c.config.QRIFThreshold
 }
 
 // SelectReplica selects the best replica based on the HCL algorithm
-func (c *Client) SelectReplica() (string, error) {
+func (c *Client) SelectReplica(job string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -188,13 +153,16 @@ func (c *Client) SelectReplica() (string, error) {
 		}
 	}
 
-	// Find and increment the use count of the selected probe in the original probes slice
+	// Find and increment the use count of the selected probe
 	for i := range c.probes {
 		if c.probes[i].ServerID == selected.ServerID {
 			c.probes[i].UseCount++
+			metrics.IncrementProbeReuse(selected.ServerID)
 			break
 		}
 	}
+
+	metrics.IncrementServerChosen(selected.ServerID, job)
 
 	return selected.ServerID, nil
 }
@@ -233,12 +201,22 @@ func (c *Client) Probe() {
 	for _, server := range c.pool.Servers {
 		probeInfo, err := c.ProbeServer(server)
 		if err != nil {
-			// Handle error, maybe log it
 			continue
 		}
 
-		c.updateRIFDistribution(probeInfo)
+		// Update maxRIF if we see a higher value
+		if probeInfo.RIF > c.maxRIF {
+			c.maxRIF = probeInfo.RIF
+			metrics.UpdateMaxRIF(c.maxRIF)
+		}
+
 		c.probes = append(c.probes, *probeInfo)
+	}
+
+	// Update normalized RIF for all existing probes
+	for i := range c.probes {
+		c.updateRIFDistribution(&c.probes[i])
+		metrics.UpdateNormalizedRIF(c.probes[i].ServerID, c.probes[i].NormalizedRIF)
 	}
 	c.pool.mu.RUnlock()
 }
@@ -247,12 +225,19 @@ func (c *Client) Probe() {
 func (c *Client) removeStaleAndOverusedProbes() {
 	now := time.Now()
 	fresh := make([]ProbeInfo, 0, len(c.probes))
+	staleCount := 0
 
 	for _, probe := range c.probes {
 		if now.Sub(probe.Timestamp) < c.config.MaxProbeAge &&
 			probe.UseCount < c.config.MaxProbeUse {
 			fresh = append(fresh, probe)
+		} else {
+			staleCount++
 		}
+	}
+
+	if staleCount > 0 {
+		metrics.AddStaleProbes(staleCount)
 	}
 
 	c.probes = fresh
@@ -331,14 +316,12 @@ func (c *Client) ProbeServer(serverAddr string) (*ProbeInfo, error) {
 		ServerID:  serverAddr,
 		Timestamp: time.Now(),
 		UseCount:  0,
-		RIFDist:   make([]float64, 0, 100),
-		MaxRIF:    probeResp.RIF,
 	}, nil
 }
 
 // BatchProcess sends a batch processing request
 func (c *Client) BatchProcess(strings []string) error {
-	serverAddr, err := c.SelectReplica()
+	serverAddr, err := c.SelectReplica("batch")
 	if err != nil {
 		return fmt.Errorf("no replica available: %w", err)
 	}
@@ -364,7 +347,7 @@ func (c *Client) BatchProcess(strings []string) error {
 
 // Ping sends a ping request
 func (c *Client) Ping() error {
-	serverAddr, err := c.SelectReplica()
+	serverAddr, err := c.SelectReplica("ping")
 	if err != nil {
 		return fmt.Errorf("no replica available: %w", err)
 	}
@@ -383,7 +366,7 @@ func (c *Client) Ping() error {
 
 // MediumProcess sends a medium processing request
 func (c *Client) MediumProcess() error {
-	serverAddr, err := c.SelectReplica()
+	serverAddr, err := c.SelectReplica("medium")
 	if err != nil {
 		return fmt.Errorf("no replica available: %w", err)
 	}
