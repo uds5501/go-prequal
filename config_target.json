@@ -1,0 +1,14 @@
+{
+  "max_probe_pool_size": 16,
+  "num_replicas": 5,
+  "probe_rate": 1.0,
+  "q_rif_threshold": 0.75,
+  "delta_reuse": 0.1,
+  "max_probe_age": 5000000000,
+  "max_probe_use": 1,
+  "servers": [
+    "localhost:8081",
+    "localhost:8082",
+    "localhost:8085"
+  ]
+}

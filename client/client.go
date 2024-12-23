@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-prequel/metrics"
+	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -38,6 +40,13 @@ type ServerPool struct {
 	mu      sync.RWMutex
 }
 
+type SelectionMode string
+
+const (
+	ModeHCL        SelectionMode = "hcl"
+	ModeRoundRobin SelectionMode = "round_robin"
+)
+
 // Client manages server selection and probing
 type Client struct {
 	config Config
@@ -53,10 +62,14 @@ type Client struct {
 
 	// Track maximum RIF seen across all servers
 	maxRIF uint64
+	logger *log.Logger
+
+	rrIndex int
+	mode    SelectionMode
 }
 
 // NewClient creates a new client with the given configuration and server addresses
-func NewClient(config Config, servers []string) *Client {
+func NewClient(config Config, servers []string, mode SelectionMode) *Client {
 	if config.MaxProbePoolSize == 0 {
 		config.MaxProbePoolSize = 16
 	}
@@ -79,14 +92,18 @@ func NewClient(config Config, servers []string) *Client {
 		pool: ServerPool{
 			Servers: servers,
 		},
-		done:   make(chan struct{}),
-		maxRIF: 0, // Initialize maxRIF
+		done:    make(chan struct{}),
+		maxRIF:  0, // Initialize maxRIF
+		mode:    mode,
+		rrIndex: 0,
 	}
 
 	// Start probe ticker based on probe rate
 	interval := time.Duration(float64(time.Second) / config.ProbeRate)
 	c.probeTicker = time.NewTicker(interval)
-
+	c.logger = log.New(os.Stdout, "[Client] ", log.LstdFlags)
+	c.logger.Printf("Starting client with %d servers", len(c.pool.Servers))
+	c.logger.Printf("Config: %+v", config)
 	go c.probeLoop()
 	return c
 }
@@ -116,8 +133,35 @@ func (c *Client) isProbeHot(probe ProbeInfo) bool {
 	return probe.NormalizedRIF >= c.config.QRIFThreshold
 }
 
-// SelectReplica selects the best replica based on the HCL algorithm
 func (c *Client) SelectReplica(job string) (string, error) {
+	switch c.mode {
+	case ModeRoundRobin:
+		return c.selectReplicaRoundRobin(job)
+	default:
+		return c.selectReplicaHCL(job)
+	}
+}
+
+func (c *Client) selectReplicaRoundRobin(job string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.pool.Servers) == 0 {
+		return "", fmt.Errorf("no servers available")
+	}
+
+	server := c.pool.Servers[c.rrIndex]
+	c.rrIndex = (c.rrIndex + 1) % len(c.pool.Servers)
+
+	// Record metrics
+	metrics.IncrementServerChosen(server, job)
+	metrics.IncrementProbeSelection("round_robin", server)
+
+	c.logger.Printf("Round-robin selected server: %s", server)
+	return server, nil
+}
+
+func (c *Client) selectReplicaHCL(job string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -144,6 +188,7 @@ func (c *Client) SelectReplica(job string) (string, error) {
 				selected = &coldProbes[i]
 			}
 		}
+		metrics.IncrementProbeSelection("cold", selected.ServerID)
 	} else {
 		selected = &hotProbes[0]
 		for i := range hotProbes {
@@ -151,6 +196,7 @@ func (c *Client) SelectReplica(job string) (string, error) {
 				selected = &hotProbes[i]
 			}
 		}
+		metrics.IncrementProbeSelection("hot", selected.ServerID)
 	}
 
 	// Find and increment the use count of the selected probe
@@ -198,6 +244,7 @@ func (c *Client) Probe() {
 
 	// Probe all servers in the pool
 	c.pool.mu.RLock()
+	newProbes := make([]ProbeInfo, 0, len(c.pool.Servers))
 	for _, server := range c.pool.Servers {
 		probeInfo, err := c.ProbeServer(server)
 		if err != nil {
@@ -210,14 +257,16 @@ func (c *Client) Probe() {
 			metrics.UpdateMaxRIF(c.maxRIF)
 		}
 
-		c.probes = append(c.probes, *probeInfo)
+		newProbes = append(newProbes, *probeInfo)
 	}
 
 	// Update normalized RIF for all existing probes
-	for i := range c.probes {
-		c.updateRIFDistribution(&c.probes[i])
-		metrics.UpdateNormalizedRIF(c.probes[i].ServerID, c.probes[i].NormalizedRIF)
+	for i := range newProbes {
+		c.updateRIFDistribution(&newProbes[i])
+		metrics.UpdateNormalizedRIF(newProbes[i].ServerID, newProbes[i].NormalizedRIF)
 	}
+	// append new probes to the existing probes
+	c.probes = append(c.probes, newProbes...)
 	c.pool.mu.RUnlock()
 }
 
